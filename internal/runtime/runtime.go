@@ -167,6 +167,9 @@ func (r *Runtime) NewProxyConfig() *ProxyConfig { return &ProxyConfig{rt: r} }
 func (c *ProxyConfig) PromptInstruction() string {
 	c.rt.Store.Refresh()
 	s := c.rt.Store.Get()
+	if s.PromptMode == "custom" {
+		return s.CustomPrompt
+	}
 	return assets.Prompt(s.PromptMode)
 }
 

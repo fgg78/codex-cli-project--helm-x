@@ -412,6 +412,8 @@ export const api = {
   promptModes: (): Promise<PromptModeView[]> =>
     demoGuard(() => Backend.PromptService.Modes() as never, [] as never),
   promptSet: (mode: string) => demoGuard(() => Backend.PromptService.Set(mode) as never, undefined as never),
+  promptSaveCustom: (body: string) =>
+    demoGuard(() => Backend.PromptService.SaveCustom(body) as never, undefined as never),
 
   // 运行设置（注入频率等；整体替换式保存，先读后写）
   settings: (): Promise<AppSettings> =>

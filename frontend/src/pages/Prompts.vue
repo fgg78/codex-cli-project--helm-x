@@ -3,7 +3,7 @@
 //
 // 主操作：应用模式。切换后**下次请求即生效** —— 代理每请求读配置（INV-5），
 // 不需要重启（旧版注释里也强调了这一点）。
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { api, isDemo, type AppSettings, type PromptModeView } from '@/api/backend'
 
 const modes = ref<PromptModeView[]>([])
@@ -11,6 +11,8 @@ const selected = ref('')
 const busy = ref(false)
 const errMsg = ref('')
 const message = ref('')
+const customDraft = ref('')
+const customSaving = ref(false)
 
 // ── 注入频率（整体替换式保存，必须先读后写）──
 const settings = ref<AppSettings | null>(null)
@@ -19,11 +21,19 @@ const everyBusy = ref(false)
 
 const active = computed(() => modes.value.find((m) => m.active))
 const current = computed(() => modes.value.find((m) => m.id === selected.value))
+const currentBytes = computed(() =>
+  selected.value === 'custom' ? new TextEncoder().encode(customDraft.value).length : current.value?.bytes ?? 0,
+)
+
+watch(current, (mode) => {
+  if (mode?.id === 'custom') customDraft.value = mode.preview
+})
 
 async function load() {
   try {
     modes.value = await api.promptModes()
     selected.value = active.value?.id ?? modes.value[0]?.id ?? ''
+    customDraft.value = modes.value.find((m) => m.id === 'custom')?.preview ?? ''
     errMsg.value = ''
   } catch (e) {
     errMsg.value = e instanceof Error ? e.message : String(e)
@@ -73,6 +83,22 @@ async function apply() {
   }
 }
 
+async function saveCustom() {
+  customSaving.value = true
+  message.value = ''
+  errMsg.value = ''
+  try {
+    await api.promptSaveCustom(customDraft.value)
+    message.value = '自定义提示词已保存并启用，下次请求即生效'
+    await load()
+    selected.value = 'custom'
+  } catch (e) {
+    errMsg.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    customSaving.value = false
+  }
+}
+
 onMounted(() => {
   void load()
   void loadSettings()
@@ -93,6 +119,16 @@ onMounted(() => {
   <SectionCard title="提示词模式" :meta="active ? `当前：${active.name}` : ''">
     <template #action>
       <button
+        v-if="selected === 'custom'"
+        class="btn btn-sm btn-primary active:scale-[.97]"
+        :disabled="customSaving || !customDraft.trim()"
+        @click="saveCustom"
+      >
+        <span v-if="customSaving" class="loading loading-spinner loading-xs" />
+        保存并启用
+      </button>
+      <button
+        v-else
         class="btn btn-sm btn-primary active:scale-[.97]"
         :disabled="busy || !selected || selected === active?.id"
         @click="apply"
@@ -162,13 +198,21 @@ onMounted(() => {
     </p>
   </SectionCard>
 
-  <SectionCard v-if="current" title="预览" :meta="current.name">
+  <SectionCard v-if="current" :title="selected === 'custom' ? '自定义提示词' : '完整提示词'" :meta="`${current.name} · ${currentBytes} 字节`">
+    <textarea
+      v-if="selected === 'custom'"
+      v-model="customDraft"
+      class="textarea min-h-[420px] w-full resize-y font-mono text-[12px] leading-[1.6]"
+      spellcheck="false"
+      aria-label="自定义提示词正文"
+    />
     <pre
-      class="max-h-[320px] overflow-y-auto rounded-field border border-base-300 bg-base-200/40 p-3.5 font-mono text-[11.5px] leading-[1.6] whitespace-pre-wrap"
+      v-else
+      class="max-h-[70vh] overflow-y-auto rounded-field border border-base-300 bg-base-200/40 p-3.5 font-mono text-[11.5px] leading-[1.6] whitespace-pre-wrap"
       >{{ current.preview }}</pre
     >
-    <p class="mt-2 text-[12px] text-base-content/70">
-      仅显示开头部分，完整内容 {{ current.bytes }} 字节。
+    <p v-if="selected === 'custom'" class="mt-2 text-[12px] text-base-content/70">
+      编辑后点击“保存并启用”；保存会写入应用配置，并从下一次代理请求生效。
     </p>
   </SectionCard>
 </template>

@@ -2,6 +2,7 @@ package svc
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/ADWMC/helm-x/internal/assets"
 	"github.com/ADWMC/helm-x/internal/config"
@@ -24,7 +25,7 @@ type PromptModeView struct {
 	Preview     string `json:"preview"`
 }
 
-// Modes 列出全部模式，标记当前激活项并附一小段预览。
+// Modes 列出全部模式及其完整正文。
 func (p *PromptService) Modes() ([]PromptModeView, error) {
 	cur := p.s.rt.Store.Get().PromptMode
 	modes := assets.PromptModes()
@@ -39,9 +40,14 @@ func (p *PromptService) Modes() ([]PromptModeView, error) {
 			Bytes:       m.Bytes,
 			Default:     m.Default,
 			Active:      m.ID == cur,
-			Preview:     head(body, 300),
+			Preview:     body,
 		})
 	}
+	custom := p.s.rt.Store.Get().CustomPrompt
+	out = append(out, PromptModeView{
+		ID: "custom", Name: "自定义", Description: "编辑并保存自己的提示词",
+		Bytes: len([]byte(custom)), Active: cur == "custom", Preview: custom,
+	})
 	return out, nil
 }
 
@@ -52,10 +58,16 @@ func (p *PromptService) Current() (string, error) {
 
 // Set 切换模式。下次请求即生效（代理每请求读取配置，INV-5）。
 func (p *PromptService) Set(mode string) error {
-	// 历史 ID 先归一化再落盘：配置里存的永远是现行 ID
-	mode = assets.CanonicalPromptMode(mode)
-	if !assets.IsValidPromptMode(mode) {
-		return fmt.Errorf("未知的提示词模式: %q", mode)
+	if mode == "custom" {
+		if p.s.rt.Store.Get().CustomPrompt == "" {
+			return fmt.Errorf("请先编辑并保存自定义提示词")
+		}
+	} else {
+		// 历史 ID 先归一化再落盘：配置里存的永远是现行 ID
+		mode = assets.CanonicalPromptMode(mode)
+		if !assets.IsValidPromptMode(mode) {
+			return fmt.Errorf("未知的提示词模式: %q", mode)
+		}
 	}
 	if err := p.s.rt.Store.Update(func(s *config.Settings) { s.PromptMode = mode }); err != nil {
 		return err
@@ -67,10 +79,29 @@ func (p *PromptService) Set(mode string) error {
 
 // Preview 返回指定模式的完整正文。
 func (p *PromptService) Preview(mode string) (string, error) {
+	if mode == "custom" {
+		return p.s.rt.Store.Get().CustomPrompt, nil
+	}
 	if !assets.IsValidPromptMode(mode) {
 		return "", fmt.Errorf("未知的提示词模式: %q", mode)
 	}
 	return assets.Prompt(mode), nil
+}
+
+// SaveCustom 保存并立即启用自定义提示词。
+func (p *PromptService) SaveCustom(body string) error {
+	if strings.TrimSpace(body) == "" || len([]byte(body)) > 1<<20 {
+		return fmt.Errorf("自定义提示词需为 1 字节至 1 MiB")
+	}
+	if err := p.s.rt.Store.Update(func(s *config.Settings) {
+		s.CustomPrompt = body
+		s.PromptMode = "custom"
+	}); err != nil {
+		return err
+	}
+	p.s.rt.Logger.Info("自定义提示词已保存并启用（%d 字节）", len([]byte(body)))
+	p.s.emit(EventConfigChg, nil)
+	return nil
 }
 
 // ── 关于已移除的 RulesService ──

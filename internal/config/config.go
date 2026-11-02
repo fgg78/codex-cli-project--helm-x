@@ -21,9 +21,10 @@ import (
 // Settings 是全部用户设置。字段名 = 旧版 JSON 字段名。
 type Settings struct {
 	// 代理
-	ListenPort  int    `json:"listen_port,omitempty"`
-	PromptMode  string `json:"prompt_mode"`
-	Passthrough bool   `json:"passthrough,omitempty"`
+	ListenPort   int    `json:"listen_port,omitempty"`
+	PromptMode   string `json:"prompt_mode"`
+	CustomPrompt string `json:"custom_prompt,omitempty"`
+	Passthrough  bool   `json:"passthrough,omitempty"`
 
 	// 注入频率：每 N 次请求注入 1 次提示词（按会话计数，首次请求注入）。
 	// 1 = 每次都注入（默认，兼容旧行为）。<=0 一律按 1 处理。

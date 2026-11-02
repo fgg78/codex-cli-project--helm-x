@@ -120,6 +120,8 @@ codex ──> http://127.0.0.1:1800 ──> 上游中转
 
 ## 使用教程
 
+Linux 用户请先阅读 [Linux 使用指南](docs/USAGE-LINUX.md)，其中包含配置注入、代理启停和故障排查步骤。
+
 ### 一、准备上游中转
 
 在 `~/.codex/config.toml` 中配置：
@@ -209,6 +211,24 @@ helmx proxy --restore              :: 手动还原 codex 配置后退出
 wails3 task build      :: bin/helmx.exe（单文件）
 wails3 task package    :: bin/helm-x-amd64-installer.exe（NSIS 安装包）
 ```
+
+### Linux 启动与调试
+
+在 Linux 上从源码构建并启动桌面控制台：
+
+```bash
+wails3 task build
+cd bin
+WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 ./helmx
+```
+
+开发调试时在仓库根目录运行，Wails 会构建应用并启动前端热更新服务：
+
+```bash
+WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 wails3 dev -config ./build/config.yml -port 9245
+```
+
+调试结束后按 `Ctrl+C`。如果 `wails3` 尚未安装，可执行 `go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.26`；确认 `$(go env GOPATH)/bin` 已加入 `PATH`。
 
 内嵌资产（`internal/assets/data/` 下的提示词与拒答规则）已加密：AES-256-GCM，密钥 `K = SHA-256(HELMX_ASSET_KEY)`，未设置时用内置开发种子。改完 `internal/assets/data/` 下的文件必须重新生成后再构建：
 
