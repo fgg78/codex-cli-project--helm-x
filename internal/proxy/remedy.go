@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/ADWMC/helm-x/internal/protocol/jsonwalk"
+	"github.com/ADWMC/helm-x/internal/protocol/sse"
 )
 
 // Action 是补救阶梯上执行的动作。
@@ -70,7 +71,7 @@ func (noopTamper) IsRefusal(string) bool  { return false }
 func (noopTamper) Attach(s string) string { return s }
 func (noopTamper) Marker() string         { return "" }
 
-// remedy 对 Refused/Flagged 的响应执行补救阶梯。
+// remedy 对 Refused/Flagged/CyberPolicy 的响应执行补救阶梯。
 //
 // 阶梯（docs/PLAN.md §5.5）：
 //
@@ -92,17 +93,46 @@ func (e *Engine) remedy(ctx context.Context, st ResponseState, view *RequestView
 		tm = noopTamper{}
 	}
 
-	// ── 0 级：网络安全策略拦截是**终局**，一级都不走 ──
-	//
-	// 依据（2026-10-28）：codex 把 cyber_policy 归为不可重试错误；
-	// yetone/magpie 的实测（efb7cb11d）证明内容拒绝跟着请求走、换会话无用，
-	// 原样把 400 交给客户端之后，下一个请求在同一账号立即可用。
-	// 我们此前在这里做 clean-session 重发 —— 内容没变，必然再拒，白烧额度，
-	// 还把 codex 自己的 safety_recourse 通路挡死。
+	// CyberPolicy 是内容相关错误：只有改写器产出了不同的请求，才有理由
+	// 重发一次。原样 clean-session 重发没有意义；补救失败时保持原始错误。
 	if st.Class == ClassCyberPolicy {
 		out.Action = ActionPassThrough
-		out.State = st // 保持 CyberPolicy 类别，前端才能单独显示
-		out.Notes = append(out.Notes, "网络安全策略拦截：终局判定，不重试、不改写，原样透传")
+		if deps.rewriter == nil || strings.TrimSpace(userMsg) == "" {
+			out.Notes = append(out.Notes, "网络安全策略拦截：无可用改写器或用户消息，原样透传")
+			return out
+		}
+		refusal := st.Text
+		if refusal == "" {
+			refusal = st.Reason
+		}
+		rewritten, ok := deps.rewriter.Rewrite(ctx, userMsg, refusal, view.ConversationText())
+		rewritten = strings.TrimSpace(rewritten)
+		if !ok || rewritten == "" || rewritten == strings.TrimSpace(userMsg) {
+			out.Notes = append(out.Notes, "网络安全策略拦截：改写失败或未变化，原样透传")
+			return out
+		}
+		cleanBody, err := view.BuildCleanSessionMode(rewritten, deps.streamRetry)
+		if err != nil || len(cleanBody) == 0 {
+			out.Notes = append(out.Notes, "网络安全策略拦截：无法构建改写请求，原样透传")
+			return out
+		}
+		// 策略拦截只允许一次改写重发，不叠加常规的 HTTP 重试次数。
+		deps.retry = RetryOptions{Enabled: false}
+		a := e.postForRetry(ctx, deps, view.Path, cleanBody, in)
+		out.UpstreamHits++
+		if a.Complete && a.Status >= 200 && a.Status < 300 && len(a.Body) > 0 {
+			retryState := Classify(ClassifyInput{
+				Status: a.Status, Header: a.Header, Body: a.Body, Complete: true,
+				IsRefusal: tm.IsRefusal, IsFlagged: classifyIsFlagged, IsPolicyBlock: classifyIsPolicyBlock,
+			})
+			if retryState.Class == ClassHealthy && (!deps.streamRetry || retryState.SSE) {
+				out.Action = ActionRetry
+				out.State = retryState
+				out.Notes = append(out.Notes, "网络安全策略拦截：改写重发成功")
+				return out
+			}
+		}
+		out.Notes = append(out.Notes, "网络安全策略拦截：改写重发未成功，保留原始响应")
 		return out
 	}
 
@@ -186,23 +216,27 @@ func (e *Engine) postForRetry(ctx context.Context, deps remedyDeps, path string,
 
 // classifyIsPolicyBlock 判定上游网络安全策略拦截（cyber_policy）。
 //
-// 两类来源都要认：
-//  1. 非 2xx 的响应体里带 cyber 标记（400 + safety filter: cyber_policy）；
-//  2. 200 的流里用 `response.failed` / safety_filter 下发终局（HTTP 状态看不出来）。
+// 上游实际出现过多种外形，不能只看 HTTP 状态：
+//  1. 4xx 错误体直接带策略标记；
+//  2. 200 的 SSE 用 `response.failed` / safety_filter 下发终局；
+//  3. 200 的 JSON/纯文本错误带 `codex_error_info: "cyber_policy"`，或直接返回
+//     "This content was flagged for possible cybersecurity risk..."。
 //
-// 只在**上游响应**上判，不看我们的请求体；命中即终局，不进补救阶梯。
+// 只在**上游响应**上判，不看我们的请求体；改写重发由补救阶梯决定。
 func classifyIsPolicyBlock(status int, body string) bool {
-	if !containsAny(body, policyMarkers) {
+	if !containsPolicyMarker(body) {
 		return false
 	}
 	if status >= 400 && status < 500 {
 		return true
 	}
-	// 2xx：必须是终局事件才算，避免模型正文里顺口提到这些词被误判
-	return strings.Contains(body, "response.failed") ||
-		strings.Contains(body, "safety_filter") ||
-		strings.Contains(body, `"code":"cyber_policy"`) ||
-		strings.Contains(body, `"code": "cyber_policy"`)
+	if status < 200 || status >= 300 {
+		return false
+	}
+
+	// 2xx：明确的错误信封、SSE 终局事件和完整拦截文案都属于策略终局。
+	// 普通回答里提到 cyber_policy 不满足这些条件，避免把技术说明误判为拦截。
+	return hasCyberPolicyEnvelope(body) || hasStandaloneCyberPolicyMessage(body)
 }
 
 // policyMarkers 是上游 cyber 拦截的标记词。与 codex 的 ApiError::CyberPolicy 判定同源。
@@ -215,9 +249,140 @@ var policyMarkers = []string{
 	"该会话已被网络安全策略屏蔽",
 }
 
-func containsAny(s string, subs []string) bool {
-	for _, sub := range subs {
-		if strings.Contains(s, sub) {
+// containsPolicyMarker 是策略标记匹配。上游文案的大小写并不稳定，
+// 例如 "Flagged" 与 "flagged" 都应落到同一个状态。
+func containsPolicyMarker(s string) bool {
+	lower := strings.ToLower(s)
+	for _, marker := range policyMarkers {
+		if strings.Contains(lower, strings.ToLower(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasCyberPolicyEnvelope 识别结构化终局错误。
+// 递归扫描 JSON 是为了兼容顶层 task_complete 错误、error 嵌套错误和 Responses SSE
+// 中的 response.error，而不是依赖固定字段顺序或固定空格。
+func hasCyberPolicyEnvelope(body string) bool {
+	var value any
+	if json.Unmarshal([]byte(body), &value) != nil {
+		p := &sse.Parser{}
+		for _, ev := range append(p.Feed([]byte(body)), p.Flush()...) {
+			if isCyberPolicyEvent(ev) {
+				return true
+			}
+		}
+		return false
+	}
+	if jsonContainsCyberPolicyCode(value) {
+		return true
+	}
+	// 无错误码的结构化终局也须有明确策略文案才判为 cyber。
+	if obj, ok := value.(map[string]any); ok {
+		return (obj["type"] == "response.failed" || obj["type"] == "safety_filter") &&
+			hasStandaloneCyberPolicyMessage(body)
+	}
+	return false
+}
+
+func isCyberPolicyEvent(ev sse.Event) bool {
+	var value any
+	if json.Unmarshal([]byte(ev.Data), &value) != nil {
+		return false
+	}
+	m, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	eventType, _ := m["type"].(string)
+	if jsonContainsCyberPolicyCode(value) {
+		// 终局不总叫 response.failed；response.completed 也可能在 response.error
+		// 中携带 cyber_policy。只收结构化错误信封，不扫 output 文本。
+		if m["error"] != nil {
+			return true
+		}
+		if response, ok := m["response"].(map[string]any); ok && response["error"] != nil {
+			return true
+		}
+	}
+	switch {
+	case ev.Name == "response.failed" || ev.Name == "error" || ev.Name == "safety_filter":
+	case eventType == "response.failed" || eventType == "error" || eventType == "safety_filter":
+	default:
+		return false
+	}
+	return hasStandaloneCyberPolicyMessage(ev.Data)
+}
+
+func jsonContainsCyberPolicyCode(value any) bool {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, child := range v {
+			normalizedKey := strings.ToLower(strings.TrimSpace(key))
+			code, isString := child.(string)
+			if (normalizedKey == "code" || normalizedKey == "codex_error_info") &&
+				isString && strings.EqualFold(strings.TrimSpace(code), "cyber_policy") {
+				return true
+			}
+			if jsonContainsCyberPolicyCode(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if jsonContainsCyberPolicyCode(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasStandaloneCyberPolicyMessage 识别没有结构化错误码的 2xx 文案。
+// 这里只收高度特征化的完整提示，不把普通正文里的单词 "cybersecurity risk"
+// 当作策略终局。
+func hasStandaloneCyberPolicyMessage(body string) bool {
+	var value any
+	if json.Unmarshal([]byte(body), &value) == nil {
+		return standaloneCyberMessage(value)
+	}
+	return isCyberMessage(body)
+}
+
+func standaloneCyberMessage(value any) bool {
+	switch v := value.(type) {
+	case map[string]any:
+		// 只在回答正文或错误消息本身就是拦截文案时识别，避免引用时误判。
+		for _, key := range []string{"message", "output_text", "text"} {
+			if text, ok := v[key].(string); ok && isCyberMessage(text) {
+				return true
+			}
+		}
+		for _, key := range []string{"error", "output", "content"} {
+			if standaloneCyberMessage(v[key]) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if standaloneCyberMessage(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isCyberMessage(body string) bool {
+	text := strings.ToLower(strings.Join(strings.Fields(body), " "))
+	for _, marker := range []string{
+		"this content was flagged for possible cybersecurity risk",
+		"flagged for possible cybersecurity",
+		"trusted access for cyber program",
+		"该会话已被网络安全策略屏蔽",
+	} {
+		if strings.HasPrefix(text, marker) {
 			return true
 		}
 	}
@@ -229,7 +394,7 @@ func classifyIsFlagged(status int, body string) bool {
 	if status < 400 || status >= 500 {
 		return false
 	}
-	return containsAny(body, policyMarkers)
+	return containsPolicyMarker(body)
 }
 
 // attachMarkerToState 把标记附加到响应正文，**保留原文**。

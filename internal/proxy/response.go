@@ -17,7 +17,7 @@ const (
 	ClassHealthy Class = "Healthy"
 	ClassRefused Class = "Refused"
 	ClassFlagged Class = "Flagged"
-	// ClassCyberPolicy 是**终局判定**：上游网络安全策略拦截。
+	// ClassCyberPolicy 是上游网络安全策略拦截的独立分类。
 	//
 	// 为什么要独立成一类（2026-10-28 调研依据）：
 	//   - OpenAI 把它作为一等错误码 `cyber_policy` 下发（codex-rs
@@ -25,9 +25,7 @@ const (
 	//     且**不在 Retryable 分支**；
 	//   - yetone/magpie 的实据（issue → efb7cb11d，v0.1.1324）：内容拒绝跟着**请求**走、
 	//     不跟账号走；把 cyber 400 当普通失败会让账号池被误判休息 17 分钟。
-	//     正确做法是原样把 400 交给客户端，一步不重试。
-	//   - 我们此前把它判成 Flagged 走 clean-session 重发：内容没变，必然再拒，
-	//     既烧额度，又把 codex 自己的 safety_recourse（改写建议 + Daybreak 入口）挡掉。
+	//     原文重发无效；仅在语义改写得到不同请求时做一次补救重发。
 	ClassCyberPolicy    Class = "CyberPolicy"
 	ClassUpstreamFailed Class = "UpstreamFailed"
 	ClassMalformed      Class = "Malformed"
@@ -69,7 +67,7 @@ type ClassifyInput struct {
 	Complete  bool
 	IsRefusal func(string) bool // 拒绝规则匹配；nil 表示不判拒绝
 	IsFlagged func(int, string) bool
-	// IsPolicyBlock 判定上游网络安全策略拦截（cyber_policy）。命中即终局：不重试。
+	// IsPolicyBlock 判定上游网络安全策略拦截（cyber_policy）。
 	IsPolicyBlock func(int, string) bool
 }
 
@@ -126,20 +124,19 @@ func Classify(in ClassifyInput) ResponseState {
 		return st
 	}
 
+	// 部分上游在 200 下直接返回错误文案或错误 JSON，而非正常回答。
+	// 提前于形态检查，才能识别 text/plain 的 cyber 拦截。
+	if in.IsPolicyBlock != nil && in.IsPolicyBlock(in.Status, string(in.Body)) {
+		st.Text = extractText(in.Body, isSSE)
+		st.Class = ClassCyberPolicy
+		st.Reason = "上游网络安全策略拦截"
+		return st
+	}
+
 	// 4. 形态不认识：原样透传，不猜（INV-9）。
 	if !isWellFormed(in.Body, isSSE) {
 		st.Class = ClassMalformed
 		st.Reason = "响应形态无法解析"
-		return st
-	}
-
-	// 4.5 200 里的**流内终局**：上游用 `response.failed` 事件下发 cyber_policy，
-	//     HTTP 状态仍是 200。codex 自己就是这么认的（codex-api/sse/responses_error.rs），
-	//     不认出来的话会当成正常回答，补救阶梯还会往上撞。
-	if in.IsPolicyBlock != nil && in.IsPolicyBlock(in.Status, string(in.Body)) {
-		st.Text = extractText(in.Body, isSSE)
-		st.Class = ClassCyberPolicy
-		st.Reason = "上游网络安全策略拦截（流内终局）"
 		return st
 	}
 

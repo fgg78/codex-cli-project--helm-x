@@ -21,6 +21,129 @@ const sseRefusal = "event: response.output_text.delta\n" +
 const sseHealthy = "event: response.output_text.delta\n" +
 	"data: {\"type\":\"response.output_text.delta\",\"delta\":\"这里是完整的技术方案。\"}\n\n"
 
+const sseCyberPolicy = "event: response.failed\n" +
+	"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"This content was flagged for possible cybersecurity risk.\",\"codex_error_info\":\"cyber_policy\"}}}\n\n"
+
+const sseCompletedWithCyberError = "event: response.completed\n" +
+	"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"cyber_policy\"}}}\n\n"
+
+func TestStreamCyberPolicyIsTerminal(t *testing.T) {
+	for _, body := range []string{sseCyberPolicy, sseHealthy + sseCyberPolicy, sseCompletedWithCyberError} {
+		t.Run(strings.ReplaceAll(body[:min(len(body), 24)], "\n", "_"), func(t *testing.T) {
+			up := &scriptedUpstream{responses: []stubResponse{
+				{status: 200, ct: "text/event-stream", body: body},
+				{status: 200, ct: "text/event-stream", body: sseHealthy},
+			}}
+			e, _ := newTestEngine(t, up, &testConfig{tamper: &stubTamper{}, retry: RetryOptions{Enabled: false}})
+			resp, rec := doStreamRequest(t, e, `{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"test"}]}]}`)
+			if rec.Class != ClassCyberPolicy || rec.Action != ActionPassThrough || rec.Upstream != 1 {
+				t.Fatalf("class=%s action=%s hits=%d; want CyberPolicy/pass_through/1", rec.Class, rec.Action, rec.Upstream)
+			}
+			if resp != body {
+				t.Fatalf("SSE 未原样转发\n got: %s\nwant: %s", resp, body)
+			}
+		})
+	}
+}
+
+func TestStreamCyberPolicyOnNonSSE200(t *testing.T) {
+	const body = `{"error":{"message":"This content was flagged for possible cybersecurity risk.","codex_error_info":"cyber_policy"}}`
+	up := &scriptedUpstream{responses: []stubResponse{{status: 200, ct: "application/json", body: body}}}
+	e, _ := newTestEngine(t, up, &testConfig{tamper: &stubTamper{}, retry: RetryOptions{Enabled: false}})
+	resp, rec := doStreamRequest(t, e, `{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"test"}]}]}`)
+	if rec.Class != ClassCyberPolicy || rec.Action != ActionPassThrough || rec.Upstream != 1 || resp != body {
+		t.Fatalf("class=%s action=%s hits=%d body=%s", rec.Class, rec.Action, rec.Upstream, resp)
+	}
+}
+
+func TestStreamLateCyberPolicyRewritesBeforeSending(t *testing.T) {
+	// 首段内容已超出常规窗口，终局错误只在流末尾出现。
+	original := strings.Repeat(sseHealthy, 50) + sseCyberPolicy
+	rw := &stubRewriter{result: "改写后的问题", ok: true}
+	up := &scriptedUpstream{responses: []stubResponse{
+		{status: 200, ct: "text/event-stream", body: original},
+		{status: 200, ct: "text/event-stream", body: sseHealthy},
+	}}
+	e, _ := newTestEngine(t, up, &testConfig{rewriter: rw, tamper: &stubTamper{}, retry: RetryOptions{Enabled: false}})
+	resp, rec := doStreamRequest(t, e, `{"model":"m","stream":true,"input":[{"role":"user","content":[{"text":"原始请求"}]}]}`)
+	if rec.Class != ClassHealthy || rec.Action != ActionRetry || rec.Upstream != 2 || rw.calls != 1 {
+		t.Fatalf("class=%s action=%s hits=%d rewrites=%d note=%s", rec.Class, rec.Action, rec.Upstream, rw.calls, rec.Note)
+	}
+	if resp != sseHealthy || !strings.Contains(up.lastBody(), "改写后的问题") || !strings.Contains(up.lastBody(), `"stream":true`) {
+		t.Fatalf("流式重发结果或请求错误: response=%s request=%s", resp, up.lastBody())
+	}
+}
+
+func TestStreamLateCyberPolicyRewriteFailsPreservesOriginal(t *testing.T) {
+	const original = sseHealthy + sseCyberPolicy
+	rw := &stubRewriter{result: "原始请求", ok: true}
+	up := &scriptedUpstream{responses: []stubResponse{{status: 200, ct: "text/event-stream", body: original}}}
+	e, _ := newTestEngine(t, up, &testConfig{rewriter: rw, tamper: &stubTamper{}, retry: RetryOptions{Enabled: false}})
+	resp, rec := doStreamRequest(t, e, `{"model":"m","stream":true,"input":[{"role":"user","content":[{"text":"原始请求"}]}]}`)
+	if rec.Class != ClassCyberPolicy || rec.Action != ActionPassThrough || rec.Upstream != 1 || resp != original {
+		t.Fatalf("class=%s action=%s hits=%d body=%s", rec.Class, rec.Action, rec.Upstream, resp)
+	}
+}
+
+func TestStreamNonSSECyberPolicyRewritesToSSE(t *testing.T) {
+	const original = `{"error":{"codex_error_info":"cyber_policy","message":"This content was flagged for possible cybersecurity risk."}}`
+	rw := &stubRewriter{result: "改写后的问题", ok: true}
+	up := &scriptedUpstream{responses: []stubResponse{
+		{status: 200, ct: "application/json", body: original},
+		{status: 200, ct: "text/event-stream", body: sseHealthy},
+	}}
+	e, _ := newTestEngine(t, up, &testConfig{rewriter: rw, tamper: &stubTamper{}, retry: RetryOptions{Enabled: false}})
+	resp, rec := doStreamRequest(t, e, `{"model":"m","stream":true,"input":[{"role":"user","content":[{"text":"原始请求"}]}]}`)
+	if rec.Class != ClassHealthy || rec.Action != ActionRetry || rec.Upstream != 2 || resp != sseHealthy {
+		t.Fatalf("class=%s action=%s hits=%d body=%s", rec.Class, rec.Action, rec.Upstream, resp)
+	}
+}
+
+func TestStreamCyberPolicyRejectsNonSSERetry(t *testing.T) {
+	rw := &stubRewriter{result: "改写后的问题", ok: true}
+	up := &scriptedUpstream{responses: []stubResponse{
+		{status: 200, ct: "text/event-stream", body: sseCyberPolicy},
+		{status: 200, ct: "application/json", body: `{"output_text":"非流式响应"}`},
+	}}
+	e, _ := newTestEngine(t, up, &testConfig{rewriter: rw, tamper: &stubTamper{}, retry: RetryOptions{Enabled: false}})
+	resp, rec := doStreamRequest(t, e, `{"model":"m","stream":true,"input":[{"role":"user","content":[{"text":"原始请求"}]}]}`)
+	if rec.Class != ClassCyberPolicy || rec.Action != ActionPassThrough || rec.Upstream != 2 || resp != sseCyberPolicy {
+		t.Fatalf("class=%s action=%s hits=%d body=%s", rec.Class, rec.Action, rec.Upstream, resp)
+	}
+}
+
+func TestStreamCyberPolicyAfterCommittedWindow(t *testing.T) {
+	const failed = "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"cyber_policy\"}}\n\n"
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"delta\":\""+strings.Repeat("x", 200)+"\"}\n\n")
+		w.(http.Flusher).Flush()
+		for _, part := range []string{failed[:20], failed[20:42], failed[42:]} {
+			_, _ = io.WriteString(w, part)
+			w.(http.Flusher).Flush()
+		}
+	}))
+	t.Cleanup(srv.Close)
+	e, err := New(Options{
+		Upstream: srv.URL, Listen: "127.0.0.1:0",
+		Config:            &testConfig{tamper: &stubTamper{}, retry: RetryOptions{Enabled: false}},
+		StreamWindowBytes: 64, StreamWindowMs: 50,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, rec := doStreamRequest(t, e, `{"model":"m","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"test"}]}]}`)
+	if rec.Class != ClassCyberPolicy || rec.Action != ActionPassThrough || rec.Upstream != 1 || hits.Load() != 1 {
+		t.Fatalf("class=%s action=%s hits=%d upstream=%d", rec.Class, rec.Action, rec.Upstream, hits.Load())
+	}
+	if !strings.HasSuffix(resp, failed) {
+		t.Fatalf("末尾终局事件未转发: %s", resp)
+	}
+}
+
 // ★ P0-1：流式窗口内命中拒答必须真的走补救（旧实现只打了个 note）。
 //
 // 期望：上游被请求两次（原始 + clean session 重发），客户端拿到的是**重发

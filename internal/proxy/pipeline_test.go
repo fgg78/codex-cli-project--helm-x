@@ -82,6 +82,7 @@ type testConfig struct {
 	injectEvery int
 	fallbackUA  string
 	tamper      *stubTamper
+	rewriter    Rewriter
 	// retry 必须显式设置：零值表示"不重试"，是合法配置
 	retry RetryOptions
 	// gate 是风险闸门（nil 表示未启用）
@@ -89,7 +90,7 @@ type testConfig struct {
 }
 
 func (c *testConfig) PromptInstruction() string { return c.instruction }
-func (c *testConfig) Rewriter() Rewriter        { return nil }
+func (c *testConfig) Rewriter() Rewriter        { return c.rewriter }
 func (c *testConfig) Gate() *riskgate.Gate      { return c.gate }
 func (c *testConfig) Tamper() TamperMatcher     { return c.tamper }
 func (c *testConfig) Retry() RetryOptions       { return c.retry }
@@ -113,6 +114,17 @@ func (s *stubTamper) Marker() string {
 }
 
 const DefaultTestMarker = "[MARKER]\n"
+
+type stubRewriter struct {
+	result string
+	ok     bool
+	calls  int
+}
+
+func (s *stubRewriter) Rewrite(_ context.Context, _, _, _ string) (string, bool) {
+	s.calls++
+	return s.result, s.ok
+}
 
 // 正常请求：注入生效 + 响应透传。
 func TestPipelineHealthy(t *testing.T) {
@@ -276,6 +288,79 @@ func TestCyberPolicyIsTerminal(t *testing.T) {
 	}
 	if string(respBody) != cyberBody {
 		t.Errorf("响应体被改动，应原样透传\n got: %s\nwant: %s", respBody, cyberBody)
+	}
+}
+
+func TestRolloutCyberPolicyErrorIsTerminal(t *testing.T) {
+	const cyberBody = `{"type":"task_complete","error":{"message":"This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber","codex_error_info":"cyber_policy"}}`
+	up := &scriptedUpstream{responses: []stubResponse{
+		{status: 200, body: cyberBody},
+		{status: 200, body: `{"output_text":"unexpected retry"}`},
+	}}
+	cfg := &testConfig{tamper: &stubTamper{}, retry: RetryOptions{Enabled: false}}
+	e, _ := newTestEngine(t, up, cfg)
+	rec, respBody := doRequest(t, e, `{"model":"m","stream":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"test"}]}]}`)
+	if rec.Class != ClassCyberPolicy || rec.Action != ActionPassThrough || rec.Upstream != 1 {
+		t.Fatalf("class=%s action=%s hits=%d; want CyberPolicy/pass_through/1", rec.Class, rec.Action, rec.Upstream)
+	}
+	if string(respBody) != cyberBody {
+		t.Fatalf("响应被改写: %s", respBody)
+	}
+}
+
+func TestCyberPolicyRewritesOnceBeforeRetry(t *testing.T) {
+	const original = `{"error":{"message":"This content was flagged for possible cybersecurity risk.","codex_error_info":"cyber_policy"}}`
+	rw := &stubRewriter{result: "改写后的技术问题", ok: true}
+	up := &scriptedUpstream{responses: []stubResponse{
+		{status: 400, body: original},
+		{status: 200, body: `{"output":[{"content":[{"text":"已处理"}]}]}`},
+	}}
+	e, _ := newTestEngine(t, up, &testConfig{rewriter: rw, tamper: &stubTamper{}, retry: RetryOptions{Enabled: false}})
+	rec, got := doRequest(t, e, `{"model":"m","stream":false,"input":[{"role":"user","content":[{"text":"原始请求"}]}]}`)
+	if rec.Class != ClassHealthy || rec.Action != ActionRetry || rec.Upstream != 2 || rw.calls != 1 {
+		t.Fatalf("class=%s action=%s hits=%d rewrites=%d note=%s", rec.Class, rec.Action, rec.Upstream, rw.calls, rec.Note)
+	}
+	if !strings.Contains(up.lastBody(), "改写后的技术问题") || strings.Contains(up.lastBody(), "原始请求") {
+		t.Fatalf("重发没有使用改写消息: %s", up.lastBody())
+	}
+	if !strings.Contains(string(got), "已处理") {
+		t.Fatalf("未返回重发结果: %s", got)
+	}
+}
+
+func TestCyberPolicyUnchangedOrFailedRewriteDoesNotRetry(t *testing.T) {
+	const original = `{"error":{"code":"cyber_policy"}}`
+	for _, tc := range []struct {
+		name string
+		text string
+		ok   bool
+	}{
+		{"unchanged", "原始请求", true},
+		{"failed", "新请求", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rw := &stubRewriter{result: tc.text, ok: tc.ok}
+			up := &scriptedUpstream{responses: []stubResponse{{status: 400, body: original}}}
+			e, _ := newTestEngine(t, up, &testConfig{rewriter: rw, tamper: &stubTamper{}, retry: RetryOptions{Enabled: false}})
+			rec, got := doRequest(t, e, `{"model":"m","stream":false,"input":[{"role":"user","content":[{"text":"原始请求"}]}]}`)
+			if rec.Class != ClassCyberPolicy || rec.Action != ActionPassThrough || rec.Upstream != 1 || rw.calls != 1 || string(got) != original {
+				t.Fatalf("class=%s action=%s hits=%d rewrites=%d body=%s", rec.Class, rec.Action, rec.Upstream, rw.calls, got)
+			}
+		})
+	}
+}
+
+func TestCyberPolicyRewriteStillBlockedPreservesOriginal(t *testing.T) {
+	const original = `{"error":{"code":"cyber_policy","message":"original"}}`
+	rw := &stubRewriter{result: "重新表述", ok: true}
+	up := &scriptedUpstream{responses: []stubResponse{
+		{status: 400, body: original},
+		{status: 400, body: `{"error":{"code":"cyber_policy","message":"second"}}`},
+	}}
+	e, _ := newTestEngine(t, up, &testConfig{rewriter: rw, tamper: &stubTamper{}, retry: RetryOptions{Enabled: false}})
+	rec, got := doRequest(t, e, `{"model":"m","stream":false,"input":[{"role":"user","content":[{"text":"原始请求"}]}]}`)
+	if rec.Class != ClassCyberPolicy || rec.Action != ActionPassThrough || rec.Upstream != 2 || string(got) != original {
+		t.Fatalf("class=%s action=%s hits=%d body=%s", rec.Class, rec.Action, rec.Upstream, got)
 	}
 }
 

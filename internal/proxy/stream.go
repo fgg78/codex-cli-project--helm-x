@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -54,7 +55,7 @@ func (e *Engine) handleStream(ctx context.Context, w http.ResponseWriter, r *htt
 			IsFlagged:     classifyIsFlagged,
 			IsPolicyBlock: classifyIsPolicyBlock,
 		})
-		if canTransform && view != nil && (st.Class == ClassRefused || st.Class == ClassFlagged) {
+		if canTransform && view != nil && (st.Class == ClassRefused || st.Class == ClassFlagged || st.Class == ClassCyberPolicy) {
 			userMsg, _ := view.LastUserMessage()
 			out := e.remedy(ctx, st, view, r.Header, remedyDeps{
 				upstream: e.upstream, engine: e, tamper: tm, rewriter: e.rewriter(),
@@ -66,6 +67,91 @@ func (e *Engine) handleStream(ctx context.Context, w http.ResponseWriter, r *htt
 			if len(out.Notes) > 0 {
 				rec.Note = strings.Join(out.Notes, "; ")
 			}
+		}
+		rec.Class = st.Class
+		rec.OutBytes = len(st.Body())
+		e.writeResponse(w, st)
+		return
+	}
+
+	// 请求期望 SSE，但上游可能返回 200 JSON / text/plain 的策略错误。
+	// 它没有 SSE 事件可供 pumpStream 解码，完整读取后按同一状态机判定。
+	if !isSSEContent(resp.Header, nil) {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+		if readErr != nil || len(body) > maxBodyBytes {
+			rec.Class = ClassUpstreamFailed
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":{"message":"上游响应不完整","type":"upstream_error"}}`))
+			return
+		}
+		st := Classify(ClassifyInput{
+			Status: resp.StatusCode, Header: resp.Header, Body: body, Complete: true,
+			IsPolicyBlock: classifyIsPolicyBlock,
+		})
+		if canTransform && view != nil && st.Class == ClassCyberPolicy {
+			userMsg, _ := view.LastUserMessage()
+			out := e.remedy(ctx, st, view, r.Header, remedyDeps{
+				upstream: e.upstream, tamper: e.tamper(), rewriter: e.rewriter(),
+				retry: e.retryOpts(), streamRetry: true,
+			}, userMsg)
+			st = out.State
+			rec.Action = out.Action
+			rec.Upstream += out.UpstreamHits
+			rec.Note = joinNote(rec.Note, strings.Join(out.Notes, "; "))
+		} else {
+			rec.Action = ActionNone
+		}
+		rec.Class = st.Class
+		rec.OutBytes = len(st.Body())
+		if st.SSE {
+			e.writeResponse(w, st)
+		} else {
+			// 非 SSE 错误仍沿用上游的状态码和类型。
+			w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+			w.WriteHeader(st.Status)
+			_, _ = w.Write(st.Body())
+		}
+		return
+	}
+
+	// 上游也可能先生成大量 SSE 正文，再在末尾发 cyber_policy。
+	// 有改写器时需要等流完整结束才能决定是否替换；超过上限则退回原窗口转发。
+	if canTransform && view != nil && e.rewriter() != nil {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+		if len(body) > maxBodyBytes && readErr == nil {
+			resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), resp.Body))
+			rec.Note = joinNote(rec.Note, "流式响应超过缓冲上限，退回窗口转发")
+			e.pumpStream(ctx, w, r, resp, view, canTransform, rec)
+			return
+		}
+		if readErr != nil {
+			rec.Class = ClassUpstreamFailed
+			rec.Note = joinNote(rec.Note, "上游流中断: "+readErr.Error())
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":{"message":"上游流中断","type":"upstream_error"}}`))
+			return
+		}
+		tm := e.tamper()
+		var isRefusal func(string) bool
+		if tm != nil {
+			isRefusal = tm.IsRefusal
+		}
+		st := Classify(ClassifyInput{
+			Status: resp.StatusCode, Header: resp.Header, Body: body, Complete: true,
+			IsRefusal: isRefusal, IsPolicyBlock: classifyIsPolicyBlock,
+		})
+		rec.Action = ActionNone
+		if st.Class == ClassCyberPolicy || st.Class == ClassRefused {
+			userMsg, _ := view.LastUserMessage()
+			out := e.remedy(ctx, st, view, r.Header, remedyDeps{
+				upstream: e.upstream, tamper: tm, rewriter: e.rewriter(),
+				retry: e.retryOpts(), streamRetry: true,
+			}, userMsg)
+			st = out.State
+			rec.Action = out.Action
+			rec.Upstream += out.UpstreamHits
+			rec.Note = joinNote(rec.Note, strings.Join(out.Notes, "; "))
 		}
 		rec.Class = st.Class
 		rec.OutBytes = len(st.Body())
@@ -101,6 +187,7 @@ func (e *Engine) pumpStream(ctx context.Context, w http.ResponseWriter, r *http.
 	parser := &sse.Parser{}
 	var acc strings.Builder
 	sawRefusal := false
+	sawPolicy := false
 	truncated := false
 
 	writeHeader := func() {
@@ -138,6 +225,19 @@ func (e *Engine) pumpStream(ctx context.Context, w http.ResponseWriter, r *http.
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
+			// 终局事件与正文拒答分开判。事件可能跨 Read 边界，也可能在已
+			// 提交响应头后到达；两种情况都要在记录里保留 CyberPolicy。
+			if canTransform && view != nil {
+				for _, ev := range parser.Feed(chunk) {
+					if isCyberPolicyEvent(ev) {
+						sawPolicy = true
+					}
+					acc.WriteString(deltaText(ev))
+				}
+				if acc.Len() <= 1200 && isCyberMessage(acc.String()) {
+					sawPolicy = true
+				}
+			}
 			if committed {
 				wn, werr := w.Write(chunk)
 				rec.OutBytes += wn
@@ -163,10 +263,7 @@ func (e *Engine) pumpStream(ctx context.Context, w http.ResponseWriter, r *http.
 				//   - 解析/累计正文一直做，用于如实记录"这条流是拒绝"
 				//   - 补救只在**尚未提交**、且拒绝出现在窗口内的文字上时做 ——
 				//     一旦内容已经写给客户端，再补救就是重复投递
-				if canTransform && view != nil {
-					for _, ev := range parser.Feed(chunk) {
-						acc.WriteString(deltaText(ev))
-					}
+				if canTransform && view != nil && !sawPolicy {
 					if !sawRefusal {
 						if tm := e.tamper(); tm != nil && tm.IsRefusal(acc.String()) {
 							sawRefusal = true
@@ -193,6 +290,12 @@ func (e *Engine) pumpStream(ctx context.Context, w http.ResponseWriter, r *http.
 			if !errors.Is(rerr, io.EOF) {
 				truncated = true
 				rec.Note = "上游流中断: " + rerr.Error()
+			} else if canTransform && view != nil {
+				for _, ev := range parser.Flush() {
+					if isCyberPolicyEvent(ev) {
+						sawPolicy = true
+					}
+				}
 			}
 			break
 		}
@@ -210,6 +313,10 @@ func (e *Engine) pumpStream(ctx context.Context, w http.ResponseWriter, r *http.
 	case truncated:
 		// 半截流不是 Healthy：日志与 UI 都必须看出来上游断了
 		rec.Class = ClassUpstreamFailed
+	case sawPolicy:
+		rec.Class = ClassCyberPolicy
+		rec.Action = ActionPassThrough
+		rec.Note = joinNote(rec.Note, "流式网络安全策略拦截：原样透传")
 	case sawRefusal:
 		// 内容已经转发出去，不能再补救（否则重复投递），但如实记为拒绝
 		rec.Class = ClassRefused

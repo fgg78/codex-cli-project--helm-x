@@ -243,7 +243,7 @@ func (s *LoggerSink) Request(rec proxy.RequestRecord) {
 	if s == nil {
 		return
 	}
-	if rec.Class == proxy.ClassFlagged && s.Logger != nil && s.CyberDir != "" {
+	if (rec.Class == proxy.ClassFlagged || rec.Class == proxy.ClassCyberPolicy) && s.Logger != nil && s.CyberDir != "" {
 		s.Logger.Cyber(s.CyberDir, map[string]any{
 			"path":   rec.Path,
 			"class":  rec.Class,

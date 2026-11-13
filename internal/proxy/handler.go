@@ -270,6 +270,8 @@ func (e *Engine) handleBuffered(ctx context.Context, w http.ResponseWriter, r *h
 	ct := "application/json"
 	if st.SSE {
 		ct = "text/event-stream; charset=utf-8"
+	} else if st.Class == ClassCyberPolicy && attempt.Header.Get("Content-Type") != "" {
+		ct = attempt.Header.Get("Content-Type")
 	}
 	rec.OutBytes = len(finalBody)
 

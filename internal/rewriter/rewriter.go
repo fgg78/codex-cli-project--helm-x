@@ -70,6 +70,7 @@ func New(cfg Config, systemPrompt string) *Rewriter {
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = 3
 	}
+	cfg.Model = strings.TrimSpace(cfg.Model)
 	if strings.TrimSpace(systemPrompt) == "" {
 		systemPrompt = defaultSystemPrompt
 	}
@@ -123,7 +124,7 @@ func (r *Rewriter) Rewrite(ctx context.Context, userMsg, refusal, conversation s
 		if out == "" {
 			continue
 		}
-		if out != userMsg || attempt == 1 {
+		if out != strings.TrimSpace(userMsg) {
 			return out, true
 		}
 	}
